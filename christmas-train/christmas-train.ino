@@ -1,150 +1,101 @@
 #include <WiFi.h>
-#include <time.h>
+#include <PubSubClient.h>
 #include <ESP32Servo.h>
 
-// --- WIFI ---
+// ---- WIFI ----
 const char* ssid     = "";
 const char* password = "";
 
-// --- TIME ---
-const char* ntpServer = "ntp.se";
-const long  gmtOffset_sec = 3600;     // Sweden UTC+1
-const int   daylightOffset_sec = 0;   // DST adjustment if needed
+// ---- MQTT ----
+const char* mqtt_server = "";
+const int   mqtt_port   = 1883;
+const char* mqtt_topic  = "train/pwm";
 
-// Re-sync NTP every hour
-const unsigned long NTP_SYNC_INTERVAL_MS = 3600000UL;
-unsigned long lastNtpSync = 0;
+// ---- MQTT AUTH ----
+const char* mqtt_user     = "";
+const char* mqtt_pass     = "";
 
-// --- ESC ---
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// ---- ESC ----
 Servo esc;
-const int ESC_PIN   = 23;
-const int NEUTRAL   = 1504;
-const int FORWARD   = 1700;
-const int REVERSE   = 1300;
+const int ESC_PIN = 23;   // PWM pin
 
-// --- SHUTTLE TIMING ---
-const unsigned long RUN_TIME_MS = 8000;
+// ---- CALLBACK ----
+void callback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("MQTT message on [");
+  Serial.print(topic);
+  Serial.print("]: ");
 
-// WALL CLOCK TRIGGER: change these easily
-int triggerSecond = 1800;
+  // Convert payload to string
+  String msg;
+  for (unsigned int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+  Serial.println(msg);
 
-// State
-bool goingForward = true;
-bool hasTriggeredThisSecond = false;   // prevents multiple triggers
-
-void printTimePrefix() {
-  struct tm timeinfo;
-  if (getLocalTime(&timeinfo)) {
-    char buf[64];
-    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
-    Serial.print("[");
-    Serial.print(buf);
-    Serial.print("] ");
+  int pwmVal = msg.toInt();
+  if (pwmVal >= 1000 && pwmVal <= 2000) {
+    Serial.print("Setting ESC to ");
+    Serial.println(pwmVal);
+    esc.writeMicroseconds(pwmVal);
   } else {
-    Serial.print("[no time] ");
+    Serial.println("Invalid PWM value (1000–2000 only).");
   }
 }
 
-void connectWiFi() {
-  if (WiFi.status() == WL_CONNECTED) return;
-  Serial.print("Connecting to WiFi");
+// ---- MQTT RECONNECT ----
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("MQTT connecting... ");
+
+    // IMPORTANT: pass username + password here
+    if (client.connect("TrainESC", mqtt_user, mqtt_pass)) {
+      Serial.println("connected!");
+
+      client.subscribe(mqtt_topic);
+      Serial.print("Subscribed to ");
+      Serial.println(mqtt_topic);
+
+    } else {
+      Serial.print("failed (rc=");
+      Serial.print(client.state());
+      Serial.println("). Retrying in 3 seconds...");
+      delay(3000);
+    }
+  }
+}
+
+void setup() {
+  // Start ESC PWM IMMEDIATELY
+  esc.attach(ESC_PIN, 1000, 2000);
+  esc.writeMicroseconds(1500);   // Neutral
+  delay(200);
+
+  Serial.begin(115200);
+  Serial.println("Booting...");
+
+  // ---- WIFI ----
   WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
   Serial.println();
-  Serial.println("Connected! IP: " + WiFi.localIP().toString());
-}
+  Serial.println("WiFi connected. IP: " + WiFi.localIP().toString());
 
-void syncTime() {
-  Serial.println("Syncing time with NTP...");
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  // ---- MQTT ----
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
 
-  struct tm timeinfo;
-  int retries = 20;
-  while (!getLocalTime(&timeinfo) && retries-- > 0) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println();
-
-  Serial.println((retries > 0) ? "Time acquired." : "Failed to sync time.");
-  lastNtpSync = millis();
-}
-
-// --- MOVEMENT FUNCTIONS ---
-void runForward() {
-  printTimePrefix();
-  Serial.println("Running forward...");
-  esc.writeMicroseconds(FORWARD);
-  delay(RUN_TIME_MS);
-  esc.writeMicroseconds(NEUTRAL);
-  printTimePrefix();
-  Serial.println("Stopped at right end.");
-}
-
-void runReverse() {
-  printTimePrefix();
-  Serial.println("Running reverse...");
-  esc.writeMicroseconds(REVERSE);
-  delay(RUN_TIME_MS);
-  esc.writeMicroseconds(NEUTRAL);
-  printTimePrefix();
-  Serial.println("Stopped at left end.");
-}
-
-void setup() {
-  // SAFELY OUTPUT NEUTRAL *BEFORE* ANYTHING ELSE
-  esc.attach(ESC_PIN, 1000, 2000);
-  esc.writeMicroseconds(NEUTRAL);
-  delay(200);
-
-  Serial.begin(115200);
-  delay(200);
-
-  Serial.println("Booting...");
-
-  connectWiFi();
-  syncTime();
-
-  Serial.println("ESC armed and system ready.");
+  reconnect();
 }
 
 void loop() {
-  unsigned long now = millis();
-
-  // --- Hourly NTP re-sync ---
-  if (now - lastNtpSync >= NTP_SYNC_INTERVAL_MS) {
-    connectWiFi();
-    syncTime();
+  if (!client.connected()) {
+    reconnect();
   }
-
-  // --- WALL CLOCK TRIGGER EVERY 20 SECONDS ---
-  struct tm timeinfo;
-
-  if (getLocalTime(&timeinfo)) {
-    int sec = timeinfo.tm_sec;
-
-    // Trigger when seconds hits 0, 20, 40
-    if (sec % triggerSecond == 0) {
-
-      if (!hasTriggeredThisSecond) {
-        // Run action
-        if (goingForward) runForward();
-        else              runReverse();
-
-        // Flip direction for *next* event
-        goingForward = !goingForward;
-
-        hasTriggeredThisSecond = true;
-      }
-
-    } else {
-      // Reset trigger once we leave the matching second
-      hasTriggeredThisSecond = false;
-    }
-  }
-
-  delay(10);
+  client.loop();
 }
