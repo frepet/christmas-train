@@ -22,6 +22,9 @@ PubSubClient client(espClient);
 Servo esc;
 const int ESC_PIN = 23;   // PWM pin
 
+// ---- CONFIG ----
+const char* status_topic = "train/controller";  // Online/offline status topic
+
 // ---- CALLBACK ----
 void callback(char* topic, byte* payload, unsigned int length) {
   Serial.print("MQTT message on [");
@@ -40,6 +43,9 @@ void callback(char* topic, byte* payload, unsigned int length) {
     Serial.print("Setting ESC to ");
     Serial.println(pwmVal);
     esc.writeMicroseconds(pwmVal);
+
+    String s = String(pwmVal);
+    client.publish("train/controller/pwm", s.c_str(), true);
   } else {
     Serial.println("Invalid PWM value (1000–2000 only).");
   }
@@ -50,10 +56,25 @@ void reconnect() {
   while (!client.connected()) {
     Serial.print("MQTT connecting... ");
 
-    // IMPORTANT: pass username + password here
-    if (client.connect("TrainESC", mqtt_user, mqtt_pass)) {
+    // Set Last Will: topic=train/controller, payload="offline", retained
+    // PubSubClient signature:
+    // connect(clientID, username, password,
+    //         willTopic, willQos, willRetain, willMessage)
+    if (client.connect(
+          "TrainESC",
+          mqtt_user,
+          mqtt_pass,
+          status_topic,   // last will topic
+          0,              // QoS
+          true,           // retained
+          "offline"       // last will payload
+        )) {
       Serial.println("connected!");
 
+      // Publish that we're online (retained so others see latest state)
+      client.publish(status_topic, "online", true);
+
+      // Subscribe to control topic as before
       client.subscribe(mqtt_topic);
       Serial.print("Subscribed to ");
       Serial.println(mqtt_topic);
