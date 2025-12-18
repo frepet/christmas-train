@@ -1,6 +1,5 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
-#include <ESP32Servo.h>
 
 // ---- WIFI ----
 const char* ssid     = "";
@@ -9,7 +8,7 @@ const char* password = "";
 // ---- MQTT ----
 const char* mqtt_server = "";
 const int   mqtt_port   = 1883;
-const char* mqtt_topic  = "train/pwm";
+const char* mqtt_topic  = "train/speed";
 
 // ---- MQTT AUTH ----
 const char* mqtt_user     = "";
@@ -18,12 +17,12 @@ const char* mqtt_pass     = "";
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-// ---- ESC ----
-Servo esc;
-const int ESC_PIN = 23;   // PWM pin
+// ---- H-BRIDGE MOTOR DRIVER ----
+const int HBRIDGE_PIN1 = 32;  // H-bridge input A
+const int HBRIDGE_PIN2 = 33;  // H-bridge input B
 
 // ---- CONFIG ----
-const char* status_topic = "train/controller";  // Online/offline status topic
+const char* status_topic = "train/controller";
 
 // ---- CALLBACK ----
 void callback(char* topic, byte* payload, unsigned int length) {
@@ -38,16 +37,24 @@ void callback(char* topic, byte* payload, unsigned int length) {
   }
   Serial.println(msg);
 
-  int pwmVal = msg.toInt();
-  if (pwmVal >= 1000 && pwmVal <= 2000) {
-    Serial.print("Setting ESC to ");
-    Serial.println(pwmVal);
-    esc.writeMicroseconds(pwmVal);
+  int speedVal = msg.toInt();
+  if (speedVal >= -100 && speedVal <= 100) {
+    if (speedVal > 0) {
+      // Forward
+      analogWrite(HBRIDGE_PIN1, map(speedVal, 0, 100, 255, 0));
+      analogWrite(HBRIDGE_PIN2, 255);
+    } else if (speedVal < 0) {
+      // Reverse
+      analogWrite(HBRIDGE_PIN1, 255);
+      analogWrite(HBRIDGE_PIN2, map(speedVal, 0, -100, 255, 0));
+    } else {
+      // Coast
+      analogWrite(HBRIDGE_PIN1, 255);
+      analogWrite(HBRIDGE_PIN2, 255);
+    }
 
-    String s = String(pwmVal);
-    client.publish("train/controller/pwm", s.c_str(), true);
-  } else {
-    Serial.println("Invalid PWM value (1000–2000 only).");
+    String s = String(speedVal);
+    client.publish("train/controller/speed", s.c_str(), true);
   }
 }
 
@@ -56,10 +63,6 @@ void reconnect() {
   while (!client.connected()) {
     Serial.print("MQTT connecting... ");
 
-    // Set Last Will: topic=train/controller, payload="offline", retained
-    // PubSubClient signature:
-    // connect(clientID, username, password,
-    //         willTopic, willQos, willRetain, willMessage)
     if (client.connect(
           "TrainESC",
           mqtt_user,
@@ -71,10 +74,8 @@ void reconnect() {
         )) {
       Serial.println("connected!");
 
-      // Publish that we're online (retained so others see latest state)
       client.publish(status_topic, "online", true);
 
-      // Subscribe to control topic as before
       client.subscribe(mqtt_topic);
       Serial.print("Subscribed to ");
       Serial.println(mqtt_topic);
@@ -89,9 +90,13 @@ void reconnect() {
 }
 
 void setup() {
-  // Start ESC PWM IMMEDIATELY
-  esc.attach(ESC_PIN, 1000, 2000);
-  esc.writeMicroseconds(1500);   // Neutral
+  // Initialize H-bridge pins
+  pinMode(HBRIDGE_PIN1, OUTPUT);
+  pinMode(HBRIDGE_PIN2, OUTPUT);
+  
+  // Set initial state to coast (1,1)
+  digitalWrite(HBRIDGE_PIN1, HIGH);
+  digitalWrite(HBRIDGE_PIN2, HIGH);
   delay(200);
 
   Serial.begin(115200);
